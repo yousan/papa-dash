@@ -14,3 +14,7 @@
 # Python
 __pycache__/
 *.pyc
+
+# Secrets
+config.h
+!config.h.example
