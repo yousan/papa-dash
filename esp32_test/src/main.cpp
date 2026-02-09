@@ -1,32 +1,256 @@
 #include <Arduino.h>
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
+#include "esp_sleep.h"
+#include "driver/rtc_io.h"
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <Preferences.h>
 
-// ESP32 Discord Webhook テスト
-
-#include "config.h"
-// config.h に以下を定義:
-//   WIFI_SSID, WIFI_PASS, DISCORD_WEBHOOK_URL
+// ESP32 Papa Dash - DeepSleep + 長押し設定モード
 
 #define LED_PIN 2
-#define BUTTON_PIN 0
+#define BUTTON_PIN 4  // GPIO4 (RTC_GPIO10) - 外部ボタン: GPIO4 → スイッチ → GND
+#define AP_SSID "PapaDash-Setup"
+#define DNS_PORT 53
+#define WEB_PORT 80
+#define WIFI_CONNECT_TIMEOUT 20000   // 20秒
+#define LONG_PRESS_THRESHOLD 5000    // 5秒長押しで設定モード
+#define SETUP_TIMEOUT 300000         // 設定モード5分タイムアウト
+#define LED_FAST_BLINK 100           // 長押し検出中の超高速点滅
+#define LED_SETUP_BLINK 1000         // 設定モードの点滅間隔
 
-void sendDiscordMessage(const char* message) {
+bool inSetupMode = false;
+unsigned long setupStartTime = 0;
+
+Preferences prefs;
+WebServer server(WEB_PORT);
+DNSServer dnsServer;
+
+// NVSから読み込んだ設定
+String nvsSSID;
+String nvsPass;
+String nvsWebhookURL;
+String nvsMessage;
+
+// LED制御
+unsigned long ledLastToggle = 0;
+bool ledState = false;
+
+// --- HTML生成 ---
+
+String escapeHtml(const String& s) {
+  String out = s;
+  out.replace("&", "&amp;");
+  out.replace("<", "&lt;");
+  out.replace(">", "&gt;");
+  out.replace("\"", "&quot;");
+  out.replace("'", "&#39;");
+  return out;
+}
+
+String buildConfigPage() {
+  String html = R"rawliteral(<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PapaDash 設定</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,sans-serif;background:#f0f2f5;padding:16px;font-size:16px}
+.card{background:#fff;border-radius:12px;padding:24px;max-width:400px;margin:0 auto;box-shadow:0 2px 8px rgba(0,0,0,0.1)}
+h1{font-size:20px;margin-bottom:8px;color:#333}
+p.desc{font-size:14px;color:#666;margin-bottom:20px}
+label{display:block;font-size:14px;font-weight:600;color:#555;margin-bottom:4px;margin-top:16px}
+input[type=text],input[type=password]{width:100%;padding:12px;border:1px solid #ddd;border-radius:8px;font-size:16px;-webkit-appearance:none}
+input:focus{outline:none;border-color:#5865F2;box-shadow:0 0 0 3px rgba(88,101,242,0.15)}
+button{width:100%;padding:14px;background:#5865F2;color:#fff;border:none;border-radius:8px;font-size:16px;font-weight:600;margin-top:24px;cursor:pointer}
+button:active{background:#4752C4}
+.ok{background:#57F287;color:#333;padding:16px;border-radius:8px;text-align:center;margin-top:16px;font-weight:600}
+</style>
+</head>
+<body>
+<div class="card">
+<h1>PapaDash 設定</h1>
+<p class="desc">WiFiとDiscordの設定を入力してください</p>
+<form method="POST" action="/save">
+<label>WiFi SSID</label>
+<input type="text" name="ssid" value=")rawliteral";
+
+  html += escapeHtml(nvsSSID);
+  html += R"rawliteral(" required>
+<label>WiFi パスワード</label>
+<input type="password" name="pass" value=")rawliteral";
+
+  html += escapeHtml(nvsPass);
+  html += R"rawliteral(">
+<label>Discord Webhook URL</label>
+<input type="text" name="webhook" value=")rawliteral";
+
+  html += escapeHtml(nvsWebhookURL);
+  html += R"rawliteral(" required>
+<label>送信メッセージ</label>
+<input type="text" name="message" value=")rawliteral";
+
+  html += escapeHtml(nvsMessage.isEmpty() ? "パパ、トイレットペーパーを買ってきて" : nvsMessage);
+  html += R"rawliteral(" required>
+<button type="submit">保存して再起動</button>
+</form>
+</div>
+</body>
+</html>)rawliteral";
+
+  return html;
+}
+
+String buildSuccessPage() {
+  return R"rawliteral(<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PapaDash 設定完了</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,sans-serif;background:#f0f2f5;padding:16px;font-size:16px}
+.card{background:#fff;border-radius:12px;padding:24px;max-width:400px;margin:0 auto;box-shadow:0 2px 8px rgba(0,0,0,0.1);text-align:center}
+h1{font-size:20px;color:#333;margin-bottom:12px}
+p{color:#666;font-size:14px}
+.ok{background:#57F287;color:#333;padding:16px;border-radius:8px;font-weight:600;margin-bottom:16px}
+</style>
+</head>
+<body>
+<div class="card">
+<div class="ok">設定を保存しました</div>
+<h1>再起動します...</h1>
+<p>3秒後にESP32が再起動します。<br>WiFiに自動接続されます。</p>
+</div>
+</body>
+</html>)rawliteral";
+}
+
+// --- NVS操作 ---
+
+void loadSettings() {
+  prefs.begin("papa-dash", true);  // read-only
+  nvsSSID = prefs.getString("wifi_ssid", "");
+  nvsPass = prefs.getString("wifi_pass", "");
+  nvsWebhookURL = prefs.getString("webhook_url", "");
+  nvsMessage = prefs.getString("message", "");
+  prefs.end();
+}
+
+bool isConfigured() {
+  prefs.begin("papa-dash", true);
+  bool cfg = prefs.getBool("configured", false);
+  prefs.end();
+  return cfg;
+}
+
+void saveSettings(const String& ssid, const String& pass, const String& webhook, const String& message) {
+  prefs.begin("papa-dash", false);  // read-write
+  prefs.putString("wifi_ssid", ssid);
+  prefs.putString("wifi_pass", pass);
+  prefs.putString("webhook_url", webhook);
+  prefs.putString("message", message);
+  prefs.putBool("configured", true);
+  prefs.end();
+  Serial.println("[NVS] Settings saved.");
+}
+
+// --- LED制御 ---
+
+void updateLED() {
+  if (!inSetupMode) return;
+  unsigned long now = millis();
+  if (now - ledLastToggle >= LED_SETUP_BLINK) {
+    ledState = !ledState;
+    digitalWrite(LED_PIN, ledState ? HIGH : LOW);
+    ledLastToggle = now;
+  }
+}
+
+void ledFeedbackSuccess() {
+  digitalWrite(LED_PIN, HIGH);
+  delay(1000);
+  digitalWrite(LED_PIN, LOW);
+}
+
+void ledFeedbackFailure() {
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(150);
+    digitalWrite(LED_PIN, LOW);
+    delay(150);
+  }
+}
+
+// --- DeepSleep ---
+
+void enterDeepSleep() {
+  Serial.println("[Sleep] Entering DeepSleep...");
+  digitalWrite(LED_PIN, LOW);
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  delay(100);
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)BUTTON_PIN, 0);  // LOW で起床
+  rtc_gpio_pullup_en((gpio_num_t)BUTTON_PIN);    // deep sleep中もプルアップ維持
+  rtc_gpio_pulldown_dis((gpio_num_t)BUTTON_PIN);  // プルダウン無効化
+  Serial.println("[Sleep] Goodnight.");
+  Serial.flush();
+  esp_deep_sleep_start();
+}
+
+// --- ボタン押下タイプ検出 ---
+
+enum PressType { PRESS_SHORT, PRESS_LONG };
+
+PressType detectPressType() {
+  Serial.println("[Press] Detecting press type...");
+  unsigned long start = millis();
+
+  // ボタンが押されている間、計測（超高速LED点滅でフィードバック）
+  while (digitalRead(BUTTON_PIN) == LOW) {
+    if ((millis() - start) >= LONG_PRESS_THRESHOLD) {
+      Serial.println("[Press] Long press detected (>=5s).");
+      digitalWrite(LED_PIN, LOW);
+      return PRESS_LONG;
+    }
+    // 超高速LED点滅
+    ledState = !ledState;
+    digitalWrite(LED_PIN, ledState ? HIGH : LOW);
+    delay(LED_FAST_BLINK);
+  }
+
+  unsigned long held = millis() - start;
+  Serial.printf("[Press] Short press detected (%lums).\n", held);
+  digitalWrite(LED_PIN, LOW);
+  return PRESS_SHORT;
+}
+
+// --- Discord送信 ---
+
+bool sendDiscordMessage(const char* webhookUrl, const char* message) {
   Serial.printf("[Discord] Free heap before: %d\n", ESP.getFreeHeap());
 
   WiFiClientSecure client;
   client.setInsecure();
-  client.setTimeout(10);  // 10秒タイムアウト
+  client.setTimeout(10);
 
   HTTPClient http;
   http.setTimeout(10000);
-  http.begin(client, DISCORD_WEBHOOK_URL);
+  http.begin(client, webhookUrl);
   http.addHeader("Content-Type", "application/json");
 
-  String payload = "{\"content\":\"" + String(message) + "\"}";
+  // JSONエスケープ（簡易版）
+  String msg = String(message);
+  msg.replace("\\", "\\\\");
+  msg.replace("\"", "\\\"");
+  String payload = "{\"content\":\"" + msg + "\"}";
   Serial.println("[Discord] Sending...");
 
   int httpCode = http.POST(payload);
@@ -36,69 +260,207 @@ void sendDiscordMessage(const char* message) {
   client.stop();
 
   Serial.printf("[Discord] Free heap after: %d\n", ESP.getFreeHeap());
+
+  return (httpCode >= 200 && httpCode < 300);
 }
 
-void setup() {
-  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
-  Serial.begin(115200);
-  delay(1000);
+// --- WiFi接続 ---
 
-  Serial.println("=== ESP32 Discord Bot ===");
-
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
+bool connectWiFi() {
+  Serial.printf("[WiFi] Connecting to: %s\n", nvsSSID.c_str());
 
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.print("WiFi connecting");
+  WiFi.begin(nvsSSID.c_str(), nvsPass.c_str());
 
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 40) {
-    delay(500);
-    Serial.print(".");
-    attempts++;
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - start) < WIFI_CONNECT_TIMEOUT) {
+    delay(100);
   }
-  Serial.println();
 
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi FAILED!");
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("[WiFi] Connected! IP: ");
+    Serial.println(WiFi.localIP());
+    return true;
+  }
+
+  Serial.println("[WiFi] Connection failed!");
+  return false;
+}
+
+// --- 短押し処理 ---
+
+void handleShortPress() {
+  Serial.println("=== SHORT PRESS: Send Discord message ===");
+
+  if (!connectWiFi()) {
+    Serial.println("[ShortPress] WiFi failed.");
+    ledFeedbackFailure();
+    enterDeepSleep();
     return;
   }
 
-  Serial.print("WiFi OK! IP: ");
-  Serial.println(WiFi.localIP());
-  digitalWrite(LED_PIN, HIGH);
+  delay(500);
+  bool success = sendDiscordMessage(nvsWebhookURL.c_str(), nvsMessage.c_str());
 
-  delay(2000);
-  sendDiscordMessage("パパ、トイレットペーパーを買ってきて");
-  Serial.println("Setup done. Press BOOT button to send message.");
+  if (success) {
+    Serial.println("[ShortPress] Message sent successfully.");
+    ledFeedbackSuccess();
+  } else {
+    Serial.println("[ShortPress] Message send failed.");
+    ledFeedbackFailure();
+  }
+
+  enterDeepSleep();
+}
+
+// --- Webサーバーハンドラ ---
+
+void handleRoot() {
+  server.send(200, "text/html", buildConfigPage());
+}
+
+void handleSave() {
+  String ssid = server.arg("ssid");
+  String pass = server.arg("pass");
+  String webhook = server.arg("webhook");
+  String message = server.arg("message");
+
+  Serial.printf("[Save] SSID=%s, Webhook=%s, Message=%s\n",
+                ssid.c_str(), webhook.c_str(), message.c_str());
+
+  saveSettings(ssid, pass, webhook, message);
+
+  server.send(200, "text/html", buildSuccessPage());
+
+  delay(3000);
+  ESP.restart();
+}
+
+// キャプティブポータル検出URLへの応答
+void handleCaptivePortal() {
+  Serial.printf("[Captive] Redirecting: %s\n", server.uri().c_str());
+  server.sendHeader("Location", "http://192.168.4.1/");
+  server.send(302, "text/plain", "");
+}
+
+void handleNotFound() {
+  server.sendHeader("Location", "http://192.168.4.1/");
+  server.send(302, "text/plain", "");
+}
+
+// --- 設定モード開始 ---
+
+void startSetupMode() {
+  inSetupMode = true;
+  setupStartTime = millis();
+  Serial.println("=== SETUP MODE ===");
+
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID);
+  delay(100);
+
+  Serial.print("[AP] IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  // DNSサーバー：全ドメインを自分に向ける
+  dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
+
+  // キャプティブポータル検出URL
+  server.on("/hotspot-detect.html", handleCaptivePortal);
+  server.on("/generate_204", handleCaptivePortal);
+  server.on("/gen_204", handleCaptivePortal);
+  server.on("/connecttest.txt", handleCaptivePortal);
+  server.on("/ncsi.txt", handleCaptivePortal);
+  server.on("/fwlink", handleCaptivePortal);
+  server.on("/redirect", handleCaptivePortal);
+  server.on("/canonical.html", handleCaptivePortal);
+  server.on("/success.txt", handleCaptivePortal);
+
+  // メインページ
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/save", HTTP_POST, handleSave);
+  server.onNotFound(handleNotFound);
+
+  server.begin();
+  Serial.println("[Web] Server started on port 80");
+  Serial.println("[Setup] Connect to WiFi: " AP_SSID);
+  Serial.printf("[Setup] Timeout in %d seconds.\n", SETUP_TIMEOUT / 1000);
+}
+
+// --- Arduino setup/loop ---
+
+void setup() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
+  // ボタン状態を最速で読み取る（起動中にボタンが離されるのを防ぐ）
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  bool buttonPressed = (digitalRead(BUTTON_PIN) == LOW);
+
+  Serial.begin(115200);
+  delay(100);
+
+  Serial.println("=== Papa Dash ===");
+
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  // NVS設定読み込み
+  loadSettings();
+
+  esp_sleep_wakeup_cause_t wakeupCause = esp_sleep_get_wakeup_cause();
+  Serial.printf("[Boot] Wakeup cause: %d, button: %s\n", wakeupCause, buttonPressed ? "pressed" : "released");
+
+  if (wakeupCause == ESP_SLEEP_WAKEUP_EXT0) {
+    // 起動直後のボタン状態で判定（ノイズならすでに離されている）
+    if (!buttonPressed) {
+      Serial.println("[Boot] False wakeup (noise), going back to sleep.");
+      enterDeepSleep();
+    }
+    // ボタン押下による起床
+    Serial.println("[Boot] Woke up by button press.");
+    PressType pt = detectPressType();
+    if (pt == PRESS_SHORT) {
+      if (isConfigured() && !nvsSSID.isEmpty()) {
+        handleShortPress();  // Discord送信 → DeepSleep（この関数から戻らない）
+      } else {
+        Serial.println("[Boot] Not configured, entering setup mode.");
+        startSetupMode();
+      }
+    } else {
+      // 長押し → 設定モード
+      Serial.println("[Boot] Long press → Setup mode.");
+      startSetupMode();
+    }
+  } else {
+    // コールドブート（電源ON / 設定保存後の再起動）
+    Serial.println("[Boot] Cold boot.");
+    if (isConfigured() && !nvsSSID.isEmpty()) {
+      Serial.println("[Boot] Already configured. Entering DeepSleep immediately.");
+      enterDeepSleep();
+    } else {
+      Serial.println("[Boot] No configuration found. Starting setup mode.");
+      startSetupMode();
+    }
+  }
 }
 
 void loop() {
-  // 動作確認用：5秒ごとにシリアル出力
-  static unsigned long lastPrint = 0;
-  if (millis() - lastPrint > 5000) {
-    Serial.printf("[loop] heap=%d wifi=%d\n", ESP.getFreeHeap(), WiFi.status() == WL_CONNECTED);
-    lastPrint = millis();
+  if (!inSetupMode) {
+    // 通常ここには来ないが、安全のためDeepSleepへ
+    enterDeepSleep();
+    return;
   }
 
-  // BOOTボタン押下でDiscord送信
-  if (digitalRead(BUTTON_PIN) == LOW) {
-    delay(50);
-    if (digitalRead(BUTTON_PIN) == LOW) {
-      Serial.println("Button pressed!");
-      if (WiFi.status() == WL_CONNECTED) {
-        sendDiscordMessage("パパ、トイレットペーパーを買ってきて");
-      } else {
-        Serial.println("WiFi not connected!");
-      }
-      // ボタンリリース待ち
-      while (digitalRead(BUTTON_PIN) == LOW) {
-        delay(10);
-      }
-      Serial.println("Button released.");
-    }
+  // 設定モード
+  dnsServer.processNextRequest();
+  server.handleClient();
+  updateLED();
+
+  // タイムアウト判定
+  if ((millis() - setupStartTime) >= SETUP_TIMEOUT) {
+    Serial.println("[Setup] Timeout! Entering DeepSleep.");
+    enterDeepSleep();
   }
 
   delay(10);
