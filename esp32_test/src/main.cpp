@@ -23,6 +23,7 @@
 #define LED_SETUP_BLINK 1000         // 設定モードの点滅間隔
 
 bool inSetupMode = false;
+bool waitForButtonRelease = false;  // 長押し後、ボタンが離されるまでloop()での検出を無視
 unsigned long setupStartTime = 0;
 
 Preferences prefs;
@@ -208,7 +209,7 @@ void updateLED() {
 
 void ledFeedbackSuccess() {
   digitalWrite(LED_PIN, HIGH);
-  delay(1000);
+  delay(1400);
   digitalWrite(LED_PIN, LOW);
 }
 
@@ -247,23 +248,26 @@ enum PressType { PRESS_SHORT, PRESS_LONG };
 PressType detectPressType() {
   Serial.println("[Press] Detecting press type...");
   unsigned long start = millis();
+  unsigned long lastLow = millis();  // 最後にLOWを検出した時刻
 
-  // ボタンが押されている間、計測（超高速LED点滅でフィードバック）
-  while (digitalRead(BUTTON_PIN) == LOW) {
-    if ((millis() - start) >= LONG_PRESS_THRESHOLD) {
-      Serial.println("[Press] Long press detected (>=5s).");
-      digitalWrite(LED_PIN, LOW);
-      return PRESS_LONG;
+  // 5秒間ボタン状態を監視（チャタリング耐性あり）
+  while ((millis() - start) < LONG_PRESS_THRESHOLD) {
+    if (digitalRead(BUTTON_PIN) == LOW) {
+      lastLow = millis();
+    } else if ((millis() - lastLow) > 200) {
+      // 200ms以上連続でHIGH → ボタンが離された
+      break;
     }
-    // 超高速LED点滅
-    ledState = !ledState;
-    digitalWrite(LED_PIN, ledState ? HIGH : LOW);
-    delay(LED_FAST_BLINK);
+    delay(10);
+  }
+
+  if ((millis() - start) >= LONG_PRESS_THRESHOLD) {
+    Serial.println("[Press] Long press detected (>=5s).");
+    return PRESS_LONG;
   }
 
   unsigned long held = millis() - start;
   Serial.printf("[Press] Short press detected (%lums).\n", held);
-  digitalWrite(LED_PIN, LOW);
   return PRESS_SHORT;
 }
 
@@ -462,9 +466,16 @@ void startSetupMode() {
 // --- Arduino setup/loop ---
 
 void setup() {
-  // ボタン状態を最速で読み取る（起動中にボタンが離されるのを防ぐ）
+  // ボタンピンを設定し、1秒間連続監視（DeepSleep復帰後のGPIO安定化対応）
   pinMode(BUTTON_PIN, INPUT_PULLUP);
-  bool buttonPressed = (digitalRead(BUTTON_PIN) == LOW);
+  bool buttonPressed = false;
+  for (int i = 0; i < 100; i++) {  // 10ms × 100 = 1000ms
+    if (digitalRead(BUTTON_PIN) == LOW) {
+      buttonPressed = true;
+      break;
+    }
+    delay(10);
+  }
 
   Serial.begin(115200);
   delay(100);
@@ -481,7 +492,7 @@ void setup() {
   Serial.printf("[Boot] Wakeup cause: %d, button: %s\n", wakeupCause, buttonPressed ? "pressed" : "released");
 
   if (wakeupCause == ESP_SLEEP_WAKEUP_GPIO) {
-    // ボタン押下による起床（ESP32-C3は起動が遅く短押しだと既に離されている）
+    // ボタン押下による起床
     Serial.println("[Boot] Woke up by button press.");
     PressType pt = buttonPressed ? detectPressType() : PRESS_SHORT;
     if (pt == PRESS_SHORT) {
@@ -492,8 +503,9 @@ void setup() {
         startSetupMode();
       }
     } else {
-      // 長押し → 設定モード
+      // 長押し → 設定モード（即開始、ボタンリリースはloop()で待つ）
       Serial.println("[Boot] Long press → Setup mode.");
+      waitForButtonRelease = true;
       startSetupMode();
     }
   } else {
@@ -529,6 +541,29 @@ void loop() {
   dnsServer.processNextRequest();
   server.handleClient();
   updateLED();
+
+  // 長押しからの設定モード開始時、ボタンが離されるまで待つ
+  if (waitForButtonRelease) {
+    if (digitalRead(BUTTON_PIN) == HIGH) {
+      delay(200);  // チャタリング防止
+      waitForButtonRelease = false;
+      Serial.println("[Setup] Button released. Ready for input.");
+    }
+  } else {
+    // ボタン短押しでDeepSleepに戻る（ボタンが離されてからDeepSleep）
+    if (digitalRead(BUTTON_PIN) == LOW) {
+      delay(50);  // チャタリング防止
+      if (digitalRead(BUTTON_PIN) == LOW) {
+        Serial.println("[Setup] Button pressed. Waiting for release...");
+        while (digitalRead(BUTTON_PIN) == LOW) {
+          delay(50);
+        }
+        delay(200);  // チャタリング防止
+        Serial.println("[Setup] Entering DeepSleep.");
+        enterDeepSleep();
+      }
+    }
+  }
 
   // タイムアウト判定
   if ((millis() - setupStartTime) >= SETUP_TIMEOUT) {
