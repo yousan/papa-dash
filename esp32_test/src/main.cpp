@@ -1,8 +1,6 @@
 #include <Arduino.h>
-#include "soc/soc.h"
-#include "soc/rtc_cntl_reg.h"
 #include "esp_sleep.h"
-#include "driver/rtc_io.h"
+#include "config.h"
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
@@ -10,10 +8,11 @@
 #include <DNSServer.h>
 #include <Preferences.h>
 
-// ESP32 Papa Dash - DeepSleep + 長押し設定モード
+// ESP32-C3 Papa Dash - DeepSleep + 長押し設定モード
+// Board: Seeed XIAO ESP32C3
 
-#define LED_PIN 2
-#define BUTTON_PIN 4  // GPIO4 (RTC_GPIO10) - 外部ボタン: GPIO4 → スイッチ → GND
+#define LED_PIN 6             // GPIO6 (D4) - 外部LED
+#define BUTTON_PIN 4          // GPIO4 (D2) - 外部ボタン: GPIO4 → スイッチ → GND
 #define AP_SSID "PapaDash-Setup"
 #define DNS_PORT 53
 #define WEB_PORT 80
@@ -35,6 +34,9 @@ String nvsSSID;
 String nvsPass;
 String nvsWebhookURL;
 String nvsMessage;
+
+// WiFiスキャン結果
+String scannedSSIDs = "";
 
 // LED制御
 unsigned long ledLastToggle = 0;
@@ -66,10 +68,13 @@ body{font-family:-apple-system,sans-serif;background:#f0f2f5;padding:16px;font-s
 h1{font-size:20px;margin-bottom:8px;color:#333}
 p.desc{font-size:14px;color:#666;margin-bottom:20px}
 label{display:block;font-size:14px;font-weight:600;color:#555;margin-bottom:4px;margin-top:16px}
-input[type=text],input[type=password]{width:100%;padding:12px;border:1px solid #ddd;border-radius:8px;font-size:16px;-webkit-appearance:none}
-input:focus{outline:none;border-color:#5865F2;box-shadow:0 0 0 3px rgba(88,101,242,0.15)}
+input[type=text],input[type=password],select{width:100%;padding:12px;border:1px solid #ddd;border-radius:8px;font-size:16px;-webkit-appearance:none;background:#fff}
+select{-webkit-appearance:menulist;appearance:menulist}
+input:focus,select:focus{outline:none;border-color:#5865F2;box-shadow:0 0 0 3px rgba(88,101,242,0.15)}
 button{width:100%;padding:14px;background:#5865F2;color:#fff;border:none;border-radius:8px;font-size:16px;font-weight:600;margin-top:24px;cursor:pointer}
 button:active{background:#4752C4}
+.ssid-manual{margin-top:8px;display:none}
+.ssid-manual.show{display:block}
 .ok{background:#57F287;color:#333;padding:16px;border-radius:8px;text-align:center;margin-top:16px;font-weight:600}
 </style>
 </head>
@@ -79,10 +84,24 @@ button:active{background:#4752C4}
 <p class="desc">WiFiとDiscordの設定を入力してください</p>
 <form method="POST" action="/save">
 <label>WiFi SSID</label>
-<input type="text" name="ssid" value=")rawliteral";
+<select id="ssid_select" onchange="var m=document.getElementById('ssid_manual');var s=document.getElementById('ssid');if(this.value==='__manual__'){m.classList.add('show');s.value='';s.focus();}else{m.classList.remove('show');s.value=this.value;}">
+)rawliteral";
+
+  // スキャン結果をoptionとして追加
+  if (scannedSSIDs.length() > 0) {
+    html += scannedSSIDs;
+  } else {
+    html += "<option value=\"\">（スキャン結果なし）</option>\n";
+  }
+  html += "<option value=\"__manual__\">手動で入力...</option>\n";
+  html += R"rawliteral(</select>
+<div id="ssid_manual" class="ssid-manual">
+<input type="text" id="ssid_manual_input" placeholder="SSIDを入力" onchange="document.getElementById('ssid').value=this.value;" oninput="document.getElementById('ssid').value=this.value;">
+</div>
+<input type="hidden" name="ssid" id="ssid" value=")rawliteral";
 
   html += escapeHtml(nvsSSID);
-  html += R"rawliteral(" required>
+  html += R"rawliteral(">
 <label>WiFi パスワード</label>
 <input type="password" name="pass" value=")rawliteral";
 
@@ -101,6 +120,13 @@ button:active{background:#4752C4}
 <button type="submit">保存して再起動</button>
 </form>
 </div>
+<script>
+(function(){
+  var sel=document.getElementById('ssid_select');
+  var hid=document.getElementById('ssid');
+  if(sel.value && sel.value!=='__manual__'){hid.value=sel.value;}
+})();
+</script>
 </body>
 </html>)rawliteral";
 
@@ -142,6 +168,12 @@ void loadSettings() {
   nvsWebhookURL = prefs.getString("webhook_url", "");
   nvsMessage = prefs.getString("message", "");
   prefs.end();
+
+  // NVSが空ならconfig.hの値をデフォルトとして使用
+  if (nvsSSID.isEmpty()) nvsSSID = CONFIG_WIFI_SSID;
+  if (nvsPass.isEmpty()) nvsPass = CONFIG_WIFI_PASS;
+  if (nvsWebhookURL.isEmpty()) nvsWebhookURL = CONFIG_WEBHOOK_URL;
+  if (nvsMessage.isEmpty()) nvsMessage = CONFIG_MESSAGE;
 }
 
 bool isConfigured() {
@@ -197,9 +229,12 @@ void enterDeepSleep() {
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
   delay(100);
-  esp_sleep_enable_ext0_wakeup((gpio_num_t)BUTTON_PIN, 0);  // LOW で起床
-  rtc_gpio_pullup_en((gpio_num_t)BUTTON_PIN);    // deep sleep中もプルアップ維持
-  rtc_gpio_pulldown_dis((gpio_num_t)BUTTON_PIN);  // プルダウン無効化
+
+  // ESP32-C3: GPIO wakeup（GPIO0-5のみ対応）
+  gpio_pullup_en((gpio_num_t)BUTTON_PIN);
+  gpio_pulldown_dis((gpio_num_t)BUTTON_PIN);
+  esp_deep_sleep_enable_gpio_wakeup(BIT(BUTTON_PIN), ESP_GPIO_WAKEUP_GPIO_LOW);
+
   Serial.println("[Sleep] Goodnight.");
   Serial.flush();
   esp_deep_sleep_start();
@@ -350,10 +385,46 @@ void handleNotFound() {
 
 // --- 設定モード開始 ---
 
+void scanWiFiNetworks() {
+  Serial.println("[Scan] Scanning WiFi networks...");
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(100);
+
+  int n = WiFi.scanNetworks();
+  Serial.printf("[Scan] Found %d networks.\n", n);
+
+  scannedSSIDs = "";
+  for (int i = 0; i < n; i++) {
+    String ssid = WiFi.SSID(i);
+    if (ssid.isEmpty()) continue;  // 非表示SSID除外
+
+    // 重複排除
+    if (scannedSSIDs.indexOf("value=\"" + escapeHtml(ssid) + "\"") >= 0) continue;
+
+    int rssi = WiFi.RSSI(i);
+    // RSSI(-30〜-90dBm)を10段階に変換
+    int level = constrain(map(rssi, -90, -30, 1, 10), 1, 10);
+
+    bool selected = (ssid == nvsSSID);
+    scannedSSIDs += "<option value=\"" + escapeHtml(ssid) + "\"";
+    if (selected) scannedSSIDs += " selected";
+    scannedSSIDs += ">" + escapeHtml(ssid) + " (" + String(level) + "/10)</option>\n";
+  }
+
+  WiFi.scanDelete();
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  delay(100);
+}
+
 void startSetupMode() {
   inSetupMode = true;
   setupStartTime = millis();
   Serial.println("=== SETUP MODE ===");
+
+  // AP起動前にWiFiスキャン
+  scanWiFiNetworks();
 
   WiFi.disconnect(true);
   WiFi.mode(WIFI_AP);
@@ -391,8 +462,6 @@ void startSetupMode() {
 // --- Arduino setup/loop ---
 
 void setup() {
-  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
-
   // ボタン状態を最速で読み取る（起動中にボタンが離されるのを防ぐ）
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   bool buttonPressed = (digitalRead(BUTTON_PIN) == LOW);
@@ -400,7 +469,7 @@ void setup() {
   Serial.begin(115200);
   delay(100);
 
-  Serial.println("=== Papa Dash ===");
+  Serial.println("=== Papa Dash (XIAO ESP32C3) ===");
 
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
@@ -411,15 +480,10 @@ void setup() {
   esp_sleep_wakeup_cause_t wakeupCause = esp_sleep_get_wakeup_cause();
   Serial.printf("[Boot] Wakeup cause: %d, button: %s\n", wakeupCause, buttonPressed ? "pressed" : "released");
 
-  if (wakeupCause == ESP_SLEEP_WAKEUP_EXT0) {
-    // 起動直後のボタン状態で判定（ノイズならすでに離されている）
-    if (!buttonPressed) {
-      Serial.println("[Boot] False wakeup (noise), going back to sleep.");
-      enterDeepSleep();
-    }
-    // ボタン押下による起床
+  if (wakeupCause == ESP_SLEEP_WAKEUP_GPIO) {
+    // ボタン押下による起床（ESP32-C3は起動が遅く短押しだと既に離されている）
     Serial.println("[Boot] Woke up by button press.");
-    PressType pt = detectPressType();
+    PressType pt = buttonPressed ? detectPressType() : PRESS_SHORT;
     if (pt == PRESS_SHORT) {
       if (isConfigured() && !nvsSSID.isEmpty()) {
         handleShortPress();  // Discord送信 → DeepSleep（この関数から戻らない）
@@ -439,8 +503,17 @@ void setup() {
       Serial.println("[Boot] Already configured. Entering DeepSleep immediately.");
       enterDeepSleep();
     } else {
-      Serial.println("[Boot] No configuration found. Starting setup mode.");
-      startSetupMode();
+      // config.hに有効な設定があればNVSに自動書き込み
+      if (String(CONFIG_WIFI_SSID) != "YOUR_SSID" && String(CONFIG_WEBHOOK_URL).indexOf("YOUR_WEBHOOK_URL") < 0) {
+        Serial.println("[Boot] Loading settings from config.h...");
+        saveSettings(CONFIG_WIFI_SSID, CONFIG_WIFI_PASS, CONFIG_WEBHOOK_URL, CONFIG_MESSAGE);
+        loadSettings();
+        Serial.println("[Boot] Config.h applied. Entering DeepSleep.");
+        enterDeepSleep();
+      } else {
+        Serial.println("[Boot] No configuration found. Starting setup mode.");
+        startSetupMode();
+      }
     }
   }
 }

@@ -1,6 +1,6 @@
 #pragma once
 
-const char* WIFI_SSID = "YOUR_SSID";
-const char* WIFI_PASS = "YOUR_PASSWORD";
-
-const char* DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/YOUR_WEBHOOK_URL";
+#define CONFIG_WIFI_SSID "YOUR_SSID"
+#define CONFIG_WIFI_PASS "YOUR_PASSWORD"
+#define CONFIG_WEBHOOK_URL "https://discord.com/api/webhooks/YOUR_WEBHOOK_URL"
+#define CONFIG_MESSAGE "パパ、トイレットペーパーを買ってきて"
