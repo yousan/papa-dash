@@ -11,7 +11,7 @@
 // ESP32-C3 Papa Dash - DeepSleep + 長押し設定モード
 // Board: Seeed XIAO ESP32C3
 
-#define LED_PIN 6             // GPIO6 (D4) - 外部LED
+#define LED_PIN 3             // GPIO3 (D1) - 外部LED（GPIO0-5はDeepSleep中も状態維持可能）
 #define BUTTON_PIN 4          // GPIO4 (D2) - 外部ボタン: GPIO4 → スイッチ → GND
 #define AP_SSID "PapaDash-Setup"
 #define DNS_PORT 53
